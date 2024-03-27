@@ -20,6 +20,8 @@
 
 class PaysleyPaymentResponseModuleFrontController extends ModuleFrontController
 {
+
+    protected $orderConfirmationUrl = 'index.php?controller=order-confirmation';
     /**
      * Process payment response from the gateway in the background process.
      *
@@ -28,75 +30,74 @@ class PaysleyPaymentResponseModuleFrontController extends ModuleFrontController
     public function postProcess()
     {
         $cartId = Tools::getValue('cart_id');
-        $paymentResponse = json_decode(Tools::getValue('response'), 1);
-        $result = isset($paymentResponse['result']) ? $paymentResponse['result'] : null;
-        $status = isset($paymentResponse['status']) ? $paymentResponse['status'] : null;
-
-        if ($status) {
-            $paymentResult = [];
-            $paymentResult['payment_id'] =
-            isset($paymentResponse['response']['id']) ? $paymentResponse['response']['id'] : '';
-            $paymentResult['transaction_id'] =
-            isset($paymentResponse['customParameters']['transaction_id']) ?
-            $paymentResponse['customParameters']['transaction_id'] : '';
-            $paymentResult['amount'] =  isset($paymentResponse['amount']) ? $paymentResponse['amount'] : '';
-            $paymentResult['result'] =  isset($paymentResponse['status']) ? $paymentResponse['status'] : '';
-            $paymentResult['currency'] =
-            isset($paymentResponse['response']['currency']) ? $paymentResponse['response']['currency'] : '';
-            $paymentResult['result_code'] =
-            isset($paymentResponse['result_code']) ? $paymentResponse['result_code'] : '';
-        } elseif ($result) {
-            $paymentResult = $paymentResponse;
+        if (empty($cartId)) {
+            $this->module->addPluginLogger('Paysley - cart id is not found', 1, null, 'Cart', "", true);
+            $this->redirectError(
+                $this->l('Error while Processing Request: please try again.')
+            );
         }
-        
-        if ($paymentResult['result'] == "ACK") {
-            $this->module->addPluginLogger('Paysley - use payment gateway', 1, null, 'Cart', $cartId, true);
-            $isTransactionLogExist = $this->isTransactionLogExist($cartId);
-
-            if (!$isTransactionLogExist) {
-                Context::getContext()->cart = new Cart((int)$cartId);
-                $transactionLog = $this->setTransactionLog($paymentResult);
-                $secretkey = $this->module->generateSecretKey(
-                    $cartId,
-                    $paymentResult['currency']
-                );
-
-                if ($secretkey != Tools::getValue('secure_payment')) {
-                    $this->module->addPluginLogger(
-                        'Paysley - FRAUD Transaction',
-                        1,
-                        null,
-                        'Cart',
-                        $cartId,
-                        true
-                    );
-                }
-
+        if (empty($this->context->cookie->id_transaction)) {
+            $this->module->addPluginLogger('Paysley - transaction id is not generated', 1, null, 'Cart', $cartId, true);
+            $this->redirectError(
+                $this->l('Error while Processing Request: please try again.')
+            );
+        }
+        $paymentResponse = PaysleyApi::getPaymentDetails($this->context->cookie->id_transaction);
+        unset($this->context->cookie->id_transaction);
+        if (empty($paymentResponse['transaction'])) {
+            $this->module->addPluginLogger('Paysley - Not able to get payment transaction detail', 1, null, 'Cart',$cartId, true);
+            $this->redirectError(
+                $this->l('Error while Processing Request: please try again.')
+            );
+        }
+        $paymentResult = [];
+        $paymentResult['payment_id']     = $paymentResponse['transaction']['payment_id'] ?? '';
+        $paymentResult['transaction_id'] = $paymentResponse['transaction']['transaction_id'] ?? '';
+        $paymentResult['amount']         = $paymentResponse['transaction']['amount'] ?? '';
+        $paymentResult['result']         = $paymentResponse['transaction']['status'] ?? '';
+        $paymentResult['currency']       = $paymentResponse['transaction']['currency'] ?? '';
+        $orderStatus = $paymentResult['result'] === "success" ? Configuration::get('PS_OS_PAYMENT') : Configuration::get('PS_OS_ERROR');
+        $this->module->addPluginLogger('Paysley - use payment gateway', 1, null, 'Cart', $cartId, true);
+        $isTransactionLogExist = $this->isTransactionLogExist($cartId);
+        if (!$isTransactionLogExist) {
+            Context::getContext()->cart = new Cart((int)$cartId);
+            $transactionLog = $this->setTransactionLog($paymentResult);
+            $secretkey = $this->module->generateSecretKey(
+                $cartId,
+                $paymentResult['currency']
+            );
+            if ($secretkey != Tools::getValue('secure_payment')) {
                 $this->module->addPluginLogger(
-                    'Paysley - save transaction log from status URL',
+                    'Paysley - FRAUD Transaction',
                     1,
                     null,
                     'Cart',
                     $cartId,
                     true
                 );
-                $this->module->saveTransactionLog($transactionLog, 0);
-                $this->validatePayment($cartId);
-            } else {
-                $this->module->addPluginLogger(
-                    'Paysley - process existing order ',
-                    1,
-                    null,
-                    'Cart',
-                    $cartId,
-                    true
-                );
-                $this->updatePrestashopOrderStatus($cartId, Configuration::get('PS_OS_PAYMENT'), $paymentResult);
             }
+
+            $this->module->addPluginLogger(
+                'Paysley - save transaction log from status URL',
+                1,
+                null,
+                'Cart',
+                $cartId,
+                true
+            );
+            $this->module->saveTransactionLog($transactionLog, 0);
+            $this->validatePayment($cartId, $orderStatus);
         } else {
-            die('payment failed');
+            $this->module->addPluginLogger(
+                'Paysley - process existing order ',
+                1,
+                null,
+                'Cart',
+                $cartId,
+                true
+            );
+            $this->updatePrestashopOrderStatus($cartId, $orderStatus, $paymentResult);
         }
-        die('end');
     }
 
     /**
@@ -105,13 +106,12 @@ class PaysleyPaymentResponseModuleFrontController extends ModuleFrontController
      *
      * @return void
      */
-    public function validatePayment($cartId)
+    public function validatePayment($cartId, $orderStatus)
     {
         Context::getContext()->cart = new Cart((int)$cartId);
         $cart = $this->context->cart;
         Context::getContext()->currency = new Currency((int)$cart->id_currency);
         $customer = new Customer($cart->id_customer);
-
         $messageLog =
             'Paysley - Module Status : '. $this->module->active .
             ', Customer Id : '. $cart->id_customer .
@@ -122,10 +122,11 @@ class PaysleyPaymentResponseModuleFrontController extends ModuleFrontController
             || $cart->id_address_invoice == 0 || !$this->module->active
             || !Validate::isLoadedObject($customer)) {
             $this->module->addPluginLogger('Paysley - customer datas are not valid', 3, null, 'Cart', $cart->id, true);
-            die('Erreur etc.');
+            $this->redirectError(
+                $this->l('Error while Processing Request: please try again.')
+            );
         }
-
-        $this->processSuccessPayment($customer);
+        $this->processSuccessPayment($customer, $orderStatus);
     }
 
     /**
@@ -134,16 +135,15 @@ class PaysleyPaymentResponseModuleFrontController extends ModuleFrontController
      *
      * @return void
      */
-    protected function processSuccessPayment($customer)
+    protected function processSuccessPayment($customer, $orderStatus)
     {
         $cart = $this->context->cart;
-        $cartId = $cart->id;
+        $cartId = $cart->id;        
         $currency = $this->context->currency;
         $total = (float)($cart->getOrderTotal(true, Cart::BOTH));
-        
         $this->module->validateOrder(
             $cartId,
-            Configuration::get('PS_OS_PAYMENT'),
+            $orderStatus,
             $total,
             $this->module->displayName,
             null,
@@ -152,16 +152,15 @@ class PaysleyPaymentResponseModuleFrontController extends ModuleFrontController
             false,
             $customer->secure_key
         );
-
         $orderId = $this->module->currentOrder;
         $this->module->addPluginLogger("get order_id ".$orderId, 1, null, 'Cart', $cartId, true);
-
-        $this->updateTransactionLog(
+        $this-> updateTransactionLog(
             $orderId,
             $cartId
         );
         $messageLog = 'Paysley - order ('. $orderId .') has been successfully created';
         $this->module->addPluginLogger($messageLog, 1, null, 'Cart', $cartId, true);
+        $this->redirectSuccess($cartId);
     }
 
 
@@ -174,15 +173,16 @@ class PaysleyPaymentResponseModuleFrontController extends ModuleFrontController
     public function setTransactionLog($paymentResponse)
     {
         $cart = $this->context->cart;
+        $context = Context::getContext();
         $transactionLog = array();
+        $transactionLog['order_id'] = Tools::getValue('cart_id');
         $transactionLog['transaction_id'] = $paymentResponse['transaction_id'];
         $transactionLog['cart_id'] = Tools::getValue('cart_id');
-        $transactionLog['order_status'] = Configuration::get('PS_OS_PAYMENT');
+        $transactionLog['order_status'] = $paymentResponse['result'] === "success" ? Configuration::get('PS_OS_PAYMENT') : Configuration::get('PS_OS_ERROR');
         $transactionLog['payment_id'] = $paymentResponse['payment_id'];
         $transactionLog['currency'] = $paymentResponse['currency'];
         $transactionLog['amount'] = (float)($cart->getOrderTotal(true, Cart::BOTH));
         $transactionLog['payment_response'] = serialize($paymentResponse);
-
         return $transactionLog;
     }
 
@@ -199,14 +199,12 @@ class PaysleyPaymentResponseModuleFrontController extends ModuleFrontController
         $sql = "UPDATE paysley_order_ref SET
             order_id = '".pSQL($orderId)."' 
             where cart_id = '".pSQL($cart_id)."'";
-
         $messageLog = 'Paysley - update payment response from payment gateway : ' . $sql;
         $this->module->addPluginLogger($messageLog, 1, null, 'Order', $orderId, true);
-
         if (!Db::getInstance()->execute($sql)) {
             $messageLog = 'Paysley - failed when updating payment response from payment gateway';
             $this->module->addPluginLogger($messageLog, 3, null, 'Order', $orderId, true);
-            die('Erreur etc.');
+            $this->redirectPaymentFailed();
         }
         $this->module->addPluginLogger(
             'Paysley - payment gateway response succefully updated',
@@ -227,15 +225,9 @@ class PaysleyPaymentResponseModuleFrontController extends ModuleFrontController
     public function isTransactionLogExist($cartId)
     {
         $order = $this->module->getOrderByCartId($cartId);
-
         $messageLog = 'Paysley - existing order : ' . json_encode($order);
-            $this->module->addPluginLogger($messageLog, 1, null, 'Cart', $this->context->cart->id, true);
-
-        if (!empty($order)) {
-            return true;
-        } else {
-            return false;
-        }
+        $this->module->addPluginLogger($messageLog, 1, null, 'Cart', $this->context->cart->id, true);
+        return !empty($order);
     }
 
 
@@ -259,7 +251,7 @@ class PaysleyPaymentResponseModuleFrontController extends ModuleFrontController
         if (!Db::getInstance()->execute($sql)) {
             $messageLog = 'Paysley - failed when updating order status';
             $this->module->addPluginLogger($messageLog, 3, null, 'Order', $orderId, true);
-            die('Erreur etc.');
+            $this->redirectPaymentFailed();
         }
         $this->module->addPluginLogger(
             'Paysley - order status succefully updated',
@@ -281,11 +273,60 @@ class PaysleyPaymentResponseModuleFrontController extends ModuleFrontController
     protected function updatePrestashopOrderStatus($cartId, $orderStatus, $paymentResponse = "")
     {
         $orderLog = $this->module->getOrderByCartId($cartId);
-        $orderId= $orderLog['order_id'];
+        $orderId = $orderLog['order_id'];
         $history = new OrderHistory();
         $history->id_order = (int)$orderId;
         $history->changeIdOrderState($orderStatus, (int)($orderId));
         $history->addWithemail(true);
         $this->updateTransactionLogOrderStatus($orderId, $orderStatus, $paymentResponse);
+        $this->redirectSuccess($cartId);
+    }
+
+        /**
+     * redirect to pending payment page
+     *
+     * @return void
+     */
+    protected function redirectPaymentFailed()
+    {
+        $url = $this->context->link->getModuleLink('paysley', 'paymentReturn', array(
+            'secure_key' => $this->context->customer->secure_key), true);
+        $this->module->addPluginLogger(
+            'rediret to payment return : '.$url,
+            1,
+            null,
+            'Cart',
+            $this->context->cart->id,
+            true
+        );
+        Tools::redirect($url);
+        exit;
+    }
+
+    /**
+     * redirect to thankyou page
+     *
+     * @return void
+     */
+    protected function redirectSuccess($cartId)
+    {
+        Tools::redirect(
+            $this->orderConfirmationUrl.
+            '&id_cart='.$cartId.
+            '&id_module='.(int)$this->module->id.
+            '&key='.$this->context->customer->secure_key
+        );
+    }
+
+    /**
+     * redirect to checkout page with error message.
+     * @param string $returnMessage
+     *
+     * @return string
+     */
+    private function redirectError($returnMessage)
+    {
+        $this->errors[] = $this->l($returnMessage);
+        $this->redirectWithNotifications($this->context->link->getPageLink('order', true, null));
     }
 }

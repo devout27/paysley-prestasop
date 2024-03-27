@@ -25,9 +25,7 @@
       <div class="row">
         <div class="col-md-12">
             <p>
-                {l s='Your order on' mod='paysley'} {$shop_name|escape:'htmlall':'UTF-8'} {l s='is in the process.' mod='paysley'}
-                <br>
-                {l s='Please back again after a minutes and check your order history' mod='paysley'}
+                {l s='Your order payment on' mod='paysley'} {$shop_name|escape:'htmlall':'UTF-8'} {l s='is failed.' mod='paysley'}
             </p>
         </div>
       </div>

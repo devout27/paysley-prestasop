@@ -49,7 +49,7 @@ class Paysley extends PaymentModule
         $this->author = 'Paysley';
         $this->module_key = '1569498170f6de365fb2248b7a12cc52';
         $this->currencies = true;
-        $this->is_test_mode = Tools::substr(Configuration::get('PAYSLEY_ACCESS_KEY'), 0, 7) != 'mp_live';
+        $this->is_test_mode = Tools::substr(Configuration::get('PAYSLEY_ACCESS_KEY'), 0, 7) == 'py_test';
         $this->currencies_mode = 'checkbox';
 
         if (Configuration::get('PAYSLEY_ENABLE_LOGGING') == 'log_option_yes') {
